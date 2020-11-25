@@ -1,0 +1,7 @@
+click==7.1.2
+numpy==1.19.4
+pandas @ file:///Users/tejas/tejas/code/softwares/python_wheels/pandas-1.1.4-cp38-cp38-macosx_11_0_x86_64.whl
+python-dateutil==2.8.1
+pytz==2020.4
+six==1.15.0
+splunk-sdk==1.6.14
