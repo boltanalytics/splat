@@ -48,7 +48,7 @@ should have the following format:
 
 Here is an example of a query:
 ```bash
-splat -sc splunk.json -i firewall -st 5m -et now -v
+splat -sc splunk.json -i firewall -st -5m -et now -v
 ```
 
 When run successfully, the output should look as follows:
