@@ -1,161 +1,37 @@
-from math import isnan
 from os import stat
 from splunklib.client import connect
 
 import click
 import json
-import numpy as np
 import os
 import pandas as pd
-import re
-import shlex
 import splunklib.client as client
 import splunklib.results as results
 import time
 import warnings
 
-
-# command_line_args = {}
-# logging.basicConfig(level=logging.INFO,
-#                     format='%(asctime)s.%(msecs)03d %(levelname)s %(module)s - %(funcName)s: %(message)s',
-#                     datefmt='%Y-%m-%d %H:%M:%S',
-#                     filename='/tmp/compression_estimator.log')
+BOLT_ESTIMATED_COMPRESSION: float = 0.3
+CIM_QUERY: str = "| datamodel Network_Traffic All_Traffic search"
 
 
-def read_logs(file_name: str) -> list:
-    log_lines: list = []
-    with open(file_name, "r") as f:
-        file_contents: list = f.readlines()
-    for line in file_contents:
-        log_lines.append(line)
-
-    return log_lines
+def load_config(json_fn: str) -> dict:
+    with open(json_fn, "r") as f:
+        return json.load(f)
 
 
-def get_file_size(file_name: str) -> int:
+def get_file_size(file_name: str) -> float:
     return stat(file_name).st_size
 
 
-def convert_kv_to_string(kv_pairs: list) -> list:
-    kv_str: list = []
-    for kv_pair in kv_pairs:
-        temp: list = []
-        for k, v in kv_pair.items():
-            if isinstance(v, str):
-                temp.append(f"{k}={v}")
-            elif (isinstance(v, (int, np.integer, float, np.float))) and (not isnan(v)):
-                temp.append(f"{k}={v}")
-
-        kv_str.append(" ".join(temp))
-
-    return kv_str
-
-
-def convert_kv_to_logs(kv_pairs: list, verbatim_text: list):
-    str_kv_pairs: list = convert_kv_to_string(kv_pairs)
-    str_verbatim_text: list = [" ".join(x) for x in verbatim_text]
-
-    return [f"{kv_pair} {verb_text}" for kv_pair, verb_text in zip(str_kv_pairs, str_verbatim_text)]
-
-
-def get_size_on_disk(logs: list) -> int:
+def get_size_on_disk(logs: list) -> float:
     tmp_file_name: str = "tmp.txt"
     with open(tmp_file_name, "w") as f:
         logs_text: str = "\n".join(logs)
         f.write(logs_text)
-    file_size: int = get_file_size(tmp_file_name)
+    file_size: float = get_file_size(tmp_file_name)
     os.remove(tmp_file_name)
 
     return file_size
-
-
-def get_key_value_pairs(text: list) -> (list, list):
-    key_value_pairs: list = []
-    verbatim_content: list = []
-    for line in text:
-        kv_pairs: dict = {}
-        non_kv_content: list = []
-        for pair in shlex.split(line):
-            if "=" in pair:
-                kv_pair: list = pair.split("=")
-                kv_pairs[kv_pair[0]] = kv_pair[1]
-            else:
-                non_kv_content.append(pair)
-        key_value_pairs.append(kv_pairs)
-        verbatim_content.append(non_kv_content)
-
-    return key_value_pairs, verbatim_content
-
-
-def evaluate_ip_addr_freq(values: pd.Series, freq_thresh: float) -> bool:
-    # Split IP addresses into 4 columns.
-    ips_split: pd.DataFrame = values.str.split(".", expand=True)
-    # Get the proportion of the most frequently occurring value in a column.
-    ip_component_freq: pd.Series = ips_split.apply(lambda x: x.value_counts(normalize=True)[0], axis=0)
-    return sum(ip_component_freq.values > freq_thresh) > 2
-
-
-def evaluate_value_freq(values: pd.Series, freq_thresh: float) -> bool:
-    # if pd.api.types.is_integer_dtype(values):
-    #     return False
-    # else:
-    return round(values.value_counts(normalize=True)[0], 2) > freq_thresh
-
-
-def is_ip_addr(x: str) -> bool:
-    if not isinstance(x, str):
-        return False
-    return bool(re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", x))
-
-
-def get_signif_keys_using_freq(kv_df: pd.DataFrame, freq_thresh: float) -> list:
-    signif_keys = []
-    for col_name in kv_df.columns:
-        # Whether a column contains IP addresses is determined by only looking
-        # at the first value.
-        # if is_ip_addr(kv_df[col_name].iloc[0]):
-        #     is_col_signif = evaluate_ip_addr_freq(kv_df[col_name], freq_thresh)
-        # else:
-        is_col_signif = evaluate_value_freq(kv_df[col_name], freq_thresh)
-
-        if is_col_signif:
-            signif_keys.append(col_name)
-
-    return signif_keys
-
-
-def convert_values_to_tokens(kv_df: pd.DataFrame, cols: list):
-    for col in cols:
-        kv_df.loc[:, col] = pd.factorize(kv_df[col])[0]
-        # The `factorize` method converts NaNs to -1 which increases the size of output file.
-        # Resetting -1's to None turns a series of type `int64` to `float64`. That is because
-        # None values are represented by `numpy.nan` in a series. And `numpy.nan` is a float
-        # value. So we convert the array to the type `arrays.IntegerArray` which is an
-        # extension type implemented within Pandas.
-        # https://pandas.pydata.org/pandas-docs/stable/user_guide/integer_na.html
-        kv_df.loc[kv_df[col] == -1, col] = None
-        if kv_df[col].dtype in ["float64"]:
-            kv_df.loc[:, col] = kv_df[col].astype("Int64")
-
-    return kv_df
-
-
-def dedup_kv_pairs(log_kv_pairs: list, freq_threshold: float) -> list:
-    """
-    Convert frequently occuring values into integer tokens.
-
-    :param log_kv_pairs: List of key-value pairs.
-    :param freq_threshold: Minimum proportion required from the value of a key for the key to be converted to a
-    template.
-    :return: List of key-value pairs with frequent values deduped.
-    """
-    log_kv_df: pd.DataFrame = pd.DataFrame(log_kv_pairs)
-
-    keys_to_templatise: list = get_signif_keys_using_freq(log_kv_df, freq_threshold)
-    log_kv_df: pd.DataFrame = convert_values_to_tokens(log_kv_df, keys_to_templatise)
-    compressed_log_kv_pairs: list = log_kv_df.to_dict("records")
-
-    return compressed_log_kv_pairs
 
 
 def get_splunk_connection(splunk_config: dict) -> client.Service:
@@ -182,33 +58,12 @@ def construct_query_args(earliest_time: str, latest_time: str, query_type: str) 
     return search_args
 
 
-def check_for_sufficient_data(event_count: int) -> None:
-    if event_count <= 0:
-        raise ValueError("There are no events for the given time. Please check input parameters such as "
-                         "user credentials and query.")
-
-
-def check_processing_time(event_count: int, verbose: bool, warning_thresh: int = 180) -> None:
-    approx_processing_time = round((event_count / 100000) * 10, 2)
-    if verbose:
-        print(f"Fetching {event_count} records from Splunk will require approximately "
-              f"{approx_processing_time} minutes.")
-
-    if approx_processing_time > warning_thresh:
-        warnings.warn(f"Fetching {event_count} records from Splunk will require approximately "
-                      f"{approx_processing_time} minutes. Faster but slightly less accurate results can be seen "
-                      f"by reducing the query timespan")
-
-
-def get_splunk_query_results(splunk_connection: client.Service, query: str, search_args: dict, n: int, verbose: bool):
+def get_splunk_query_results(splunk_connection: client.Service, query: str, search_args: dict, verbose: bool):
     query_results: list = []
-
-    if n > 0:
-        query = f"{query} | head {n}"
 
     job = splunk_connection.jobs.create(query, **search_args)
     if verbose:
-        print("Querying the splunk results...")
+        print("Querying Splunk results...")
 
     while not job.is_done():
         time.sleep(.2)
@@ -220,9 +75,6 @@ def get_splunk_query_results(splunk_connection: client.Service, query: str, sear
         if isinstance(result, dict):
             query_results.append(result["_raw"])
             count += 1
-            if verbose:
-                if count % 1000 == 0:
-                    print(f"Retrieved {count} events so far and the current event is {result['_raw']}")
 
     assert rr.is_preview is False
 
@@ -246,62 +98,161 @@ def get_event_count(splunk_connection: client.Service, query: str, search_args: 
     return 0
 
 
-def splat(splunk_details: dict, index: str, start_time: str, end_time: str, num_records: int, verbose: bool):
-    search_query: str = "search index={0}".format(index)
+def get_largest_index(splunk_service: client.Service) -> str:
+    index_info: dict = {}
+    for index in splunk_service.indexes:
+        index_info[index.name] = index["totalEventCount"]
+
+    index_info_df: pd.DataFrame = (pd.DataFrame.from_dict(index_info, orient="index")
+                                   .reset_index().set_axis(["name", "count"], axis=1)
+                                   .astype({"count": int}))
+    index_info_df.sort_values(by="count", axis=0, ascending=False, inplace=True)
+
+    return index_info_df.iloc[0]["name"]
+
+
+def get_index_info(splunk_service: client.Service, idx_name: str) -> dict:
+    index_info: dict = {}
+    for index in splunk_service.indexes:
+        if index.name == idx_name:
+            index_info["size"] = float(index["maxTotalDataSizeMB"])
+            index_info["count"] = int(index["totalEventCount"])
+            return index_info
+
+
+def get_cim_compression_info(splunk_conn: client.Service, search_params: dict, verbose: bool) -> None:
+    splunk_logs: list = get_splunk_query_results(splunk_conn, CIM_QUERY, search_params, verbose)
+    input_size: float = get_size_on_disk(splunk_logs)
+    input_size = round(input_size / (1024 * 1024))
+    estimated_compressed_size: float = round(input_size * (1 - BOLT_ESTIMATED_COMPRESSION), 2)
+
+    print(f"Found {len(splunk_logs)} events in the CIM datamodel whose size is "
+          f"{input_size}MB. Estimated compressed size is {estimated_compressed_size}MB, "
+          f"a reduction of {BOLT_ESTIMATED_COMPRESSION * 100.}%")
+
+
+def get_index_compression_info(splunk_conn: client.Service, source_type: str, search_params: dict,
+                               verbose: bool) -> None:
+    warnings.warn("Found no events for CIM query. Perhaps CIM is not configured. If not specified, try providing a "
+                  "start and end time for the query. Scanning the largest index instead...")
+
+    collection_type: str = "index"
+    selected_index: str
+    selected_index_info: dict
+    if source_type:
+        splunk_query = f"search sourcetype={source_type} index=*"
+        splunk_logs: list = get_splunk_query_results(splunk_conn, splunk_query, search_params, verbose)
+        input_size: float = get_size_on_disk(splunk_logs)
+        input_size = round(input_size / (1024 * 1024))
+        selected_index = source_type
+        selected_index_info = {"count": len(splunk_logs), "size": input_size}
+        collection_type = "sourcetype"
+    else:
+        selected_index = get_largest_index(splunk_conn)
+        selected_index_info = get_index_info(splunk_conn, selected_index)
+    estimated_compressed_size: float = round(selected_index_info["size"] * (1 - BOLT_ESTIMATED_COMPRESSION), 2)
+
+    print(f"The {collection_type} '{selected_index}' contains {selected_index_info['count']} records and is of size "
+          f"{selected_index_info['size']}MB. Estimated compressed size is {estimated_compressed_size}MB, "
+          f"a reduction of {BOLT_ESTIMATED_COMPRESSION * 100.}%.")
+
+
+def query_firewall_datasource(splunk_conn: client.Service, event_count_params: dict, search_params: dict,
+                              source_type: str, verbose: bool) -> None:
+    total_event_count: int = get_event_count(splunk_conn, CIM_QUERY, event_count_params, verbose)
+    if total_event_count > 0:
+        get_cim_compression_info(splunk_conn, search_params, verbose)
+    else:
+        get_index_compression_info(splunk_conn, source_type, search_params, verbose)
+
+
+def query_windows_datasource(splunk_conn: client.Service, event_count_params: dict,
+                             source_type: str, verbose: bool) -> None:
+    if source_type:
+        windows_query: str = f"search sourcetype={source_type} index=*"
+    else:
+        windows_query: str = "search sourcetype=Wineventlog index=*"
+
+    total_event_count: int = get_event_count(splunk_conn, windows_query, event_count_params, verbose)
+    if total_event_count <= 0:
+        print("No events found for the Windows datasource.")
+
+
+def query_cloudwatch_datasource(splunk_conn: client.Service, event_count_params: dict,
+                                source_type: str, verbose: bool) -> None:
+    if source_type:
+        cloudwatch_query: str = f"search sourcetype={source_type} index=*"
+    else:
+        cloudwatch_query: str = "search sourcetype=aws:cloudwatch index=*"
+
+    total_event_count: int = get_event_count(splunk_conn, cloudwatch_query, event_count_params, verbose)
+    if total_event_count <= 0:
+        print("No events found for the Cloudwatch datasource.")
+
+
+def splat(splunk_details: dict, source_category: str, source_type: str, start_time: str, end_time: str, verbose: bool):
+    if not start_time:
+        start_time = "-5m"
+    if not end_time:
+        end_time = "now"
+
     splunk_conn: client.Service = get_splunk_connection(splunk_details)
     search_params: dict = construct_query_args(start_time, end_time, query_type="search")
     event_count_params: dict = construct_query_args(start_time, end_time, query_type="event_count")
 
-    total_event_count: int = get_event_count(splunk_conn, search_query, event_count_params, verbose)
-    check_for_sufficient_data(total_event_count)
-    check_processing_time(total_event_count, verbose)
-
-    splunk_logs: list = get_splunk_query_results(splunk_conn, search_query, search_params, num_records,
-                                                 verbose)
-    if verbose:
-        print(f"Number of records retrieved from Splunk: {len(splunk_logs)}")
-
-    input_size: int = get_size_on_disk(splunk_logs)
-
-    log_key_value_pairs: list
-    log_verbatim_text: list
-    log_key_value_pairs, log_verbatim_text = get_key_value_pairs(splunk_logs)
-    deduped_key_value_pairs: list = dedup_kv_pairs(log_key_value_pairs, 0.9)
-    deduped_splunk_logs: list = convert_kv_to_logs(deduped_key_value_pairs, log_verbatim_text)
-
-    output_size: int = get_size_on_disk(deduped_splunk_logs)
-    percent_reduction: float = round((input_size - output_size) * 100 / input_size, 2)
-
-    print(f"Input data size: {round(input_size / 1024, 2)} KBs")
-    print(f"Output data size: {round(output_size / 1024, 2)} KBs")
-    print(f"Estimated compression: {percent_reduction}%")
+    if source_category == "firewall":
+        query_firewall_datasource(splunk_conn, event_count_params, search_params, source_type, verbose)
+    elif source_category == "windows":
+        query_windows_datasource(splunk_conn, event_count_params, source_type, verbose)
+    elif source_category == "cloudwatch":
+        query_cloudwatch_datasource(splunk_conn, event_count_params, source_type, verbose)
+    else:
+        raise ValueError("Invalid source category specified. Exiting.")
 
 
 @click.command()
 @click.option("-sc", "--splunk-config", type=str, required=True, help="Path to JSON file specifying Splunk "
                                                                       "server configuration. Check GitHub "
                                                                       "README for details.")
-@click.option("-i", "--index", required=True, help="Splunk index to fetch results.")
-@click.option("-st", "--start-time", required=True, help=f"Query start time. It is specified in relation to the current"
-                                                         f"time. So `-2d` means 2 days prior to now.")
-@click.option("-et", "--end-time", required=True, help=f"Query end time. It can either be `now` or a time in the past"
-                                                       f"from the present like `-2d`.")
-@click.option("-n", type=int, default=0, help="Number of records to limit the query to.")
+@click.option("-sg", "--source-category", type=str, default="firewall", help="Source category which can be one"
+                                                                             "of [firewall, windows, cloudwatch]")
+@click.option("-sy", "--source-type", type=str, default="", help="Source type to query.")
+@click.option("-st", "--start-time", default="", help=f"Query start time. It is specified in relation to the current"
+                                                      f"time. So `-2d` means 2 days prior to now.")
+@click.option("-et", "--end-time", default="", help=f"Query end time. It can either be `now` or a time in the past"
+                                                    f"from the present like `-2d`.")
 @click.option("-v", "--verbose", is_flag=True)
-def main(splunk_config: str, index: str, start_time: str, end_time: str, n: int, verbose: bool):
-    """Estimate compression of Splunk records achieved by Bolt's <product_name>
+def main(splunk_config: str, source_category: str, source_type: str, start_time: str, end_time: str, verbose: bool):
+    """Estimate compression of Splunk records achieved using Bolt.
 
     \b
     Examples:
-        splat --splunk-config splunk.json --index firewall -n 5000 -v
-        splat --splunk-config splunk.json --index firewall --start-time 2020-11-10T12:00:00.000-00:00
+        # Default case.
+        splat --splunk-config splunk.json -v
+
+        # For Windows sourcetype.
+        splat --splunk-config splunk.json -sg windows -v
+
+        # For AWS CloudWatch sourcetype
+        splat --splunk-config splunk.json -sg cloudwatch -v
+
+        # The default source types queried for various categories are as follows:
+        # Firewall: None
+        # Windows: Wineventlog
+        # CloudWatch: aws:cloudwatch
+        # We can specify a custom source type as well.
+        splat --splunk-config splunk.json -sg firewall -sy <custom_sourcetype> -v
+
+        # By default, data fetched from Splunk is for the past 5 minutes. We can also specify
+        # custom start and end times.
+        splat --splunk-config splunk.json --start-time 2020-11-10T12:00:00.000-00:00
         --end-time 2020-11-10T13:00:00.000-00:00
     """
-    with open(splunk_config, "r") as f:
-        splunk_server_details: dict = json.load(f)
-    splat(splunk_server_details, index, start_time, end_time, n, verbose)
+    splunk_server_details = load_config(splunk_config)
+
+    splat(splunk_server_details, source_category, source_type, start_time, end_time, verbose)
 
 
 if __name__ == '__main__':
     main()
-    # main(["-sc", "../splunk.json", "-i", "firewall", "-st", "-30m", "-et", "now"])  # For debugging.
+    # main(["-sc", "../splunk.json"])  # For debugging.
